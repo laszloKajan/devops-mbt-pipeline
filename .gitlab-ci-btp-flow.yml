@@ -1,0 +1,567 @@
+# How to use?
+#  1 Create <project_root>/.gitlab-ci.yml
+#  2 Enter,  minding the leading spaces:
+#     include:
+#       - project: 'sap-aspire/scp/supporting-projects/devops-mbt-pipeline'
+#         # Prefer a commit or a tag, e.g. 'ref: 1.0.0':
+#         ref: master
+#         file: '/.gitlab-ci-btp-flow.yml'
+# 3 Fix 'ref: master' to a commit or tag as needed.
+#
+variables:
+  # kajanl: Change 'latest' to a fixed version
+  ASSIGN_TRANSPORT_REQUEST_VERSION: latest
+  # kajanl: Change 'latest' to a fixed version
+  DEVOPS_MBT_IMAGE: $CI_REGISTRY/sap-aspire/scp/supporting-projects/devops-mbt-dockerfile:latest
+  # kajanl: Change 'latest' to a fixed version
+  DEVOPS_PUPPETEER_IMAGE: $CI_REGISTRY/sap-aspire/scp/supporting-projects/devops-puppeteer-dockerfile:latest
+  # kajanl: Change 'latest' to a fixed version
+  DEVOPS_PIPER_SONAR_IMAGE: $CI_REGISTRY/sap-aspire/scp/supporting-projects/devops-piper-dockerfile/sonar-execute-scan:latest
+  DEVOPS_SCRIPTS_BRANCH: master # kajanl: fix the version, e.g. 1.2.2
+  DEVOPS_SCRIPTS_PATH: 'sap-aspire/scp/supporting-projects/devops-scripts'
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  # kajanl: https://docs.gitlab.com/ee/ci/runners/#shallow-cloning
+  #GIT_DEPTH: "3"
+  # kajanl: Change 'latest' to a fixed version
+  MTA_TRACEABILITY_TOOL_VERSION: latest
+  PACKAGE_REGISTRY_REL_ATS_URL: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/release-assets
+  PACKAGE_REGISTRY_PRD_ATS_URL: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/production-assets
+
+default:
+  # kajanl: DEVOPS_MBT_IMAGE is a good default image, because it will always be used by a mandatory step.
+  image: ${DEVOPS_MBT_IMAGE}
+  # kajanl: https://docs.gitlab.com/ee/ci/yaml/#interruptible
+  interruptible: true
+
+# https://docs.gitlab.com/ee/ci/yaml/#yaml-anchors-for-script
+# Note: we can't move this to an include: aliases don't work across includes:
+#   https://docs.gitlab.com/ee/ci/yaml/#anchors
+.clone_devops_scripts: &clone_devops_scripts
+  - 'if ! [ -e "$(basename ${DEVOPS_SCRIPTS_PATH})" ]; then
+      set -e;
+      git clone -b "${DEVOPS_SCRIPTS_BRANCH}" --depth 5 https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${DEVOPS_SCRIPTS_PATH}.git "$(basename ${DEVOPS_SCRIPTS_PATH})";
+      export PATH="$PWD/$(basename ${DEVOPS_SCRIPTS_PATH}):$PATH";
+     fi;'
+
+.add_sap_aspire_npm_repo: &add_sap_aspire_npm_repo
+  - echo "@sap-aspire:registry=https://${CI_SERVER_HOST}/api/v4/packages/npm/" >> ~/.npmrc
+  - echo "//${CI_SERVER_HOST}/api/v4/packages/npm/:_authToken=${CI_JOB_TOKEN}" >> ~/.npmrc
+
+.test_WI_in_development: &test_WI_in_development
+  - 'if [ "$CI_COMMIT_BRANCH" = "tms" ]; then
+       set -e;
+       test "${SOLMAN_HOST}";
+       test "${SOLMAN_PASS}";
+       test "${SOLMAN_USER}";
+       test "${TRANSPORT_SERVICE_NODE}";
+       test "${TRANSPORT_SERVICE_INSTANCE_KEY}";
+ 
+       if ( test "$WORK_ITEM" -a "$DEFECT_CORRECTION" ); then
+         echo "Error: both $WORK_ITEM and $DEFECT_CORRECTION are set." >&2; exit 1;
+       fi;
+       if [ "${WORK_ITEM}" ]; then
+         work-item-is-in-development "${WORK_ITEM}" "${SOLMAN_HOST}";
+       elif [ "${DEFECT_CORRECTION}" ]; then
+         defect-correction-is-in-being-corrected "${DEFECT_CORRECTION}" "${SOLMAN_HOST}";
+       else
+         echo "Error: neither $WORK_ITEM nor $DEFECT_CORRECTION is set." >&2; exit 1;
+       fi;
+     fi;'
+
+.shared_runners:
+  tags:
+    - docker
+    - linux
+
+# https://docs.gitlab.com/ee/ci/yaml/#switch-between-branch-pipelines-and-merge-request-pipelines
+# https://gitlab.com/gitlab-org/gitlab/-/blob/master/lib/gitlab/ci/templates/Workflows/MergeRequest-Pipelines.gitlab-ci.yml
+workflow:
+  rules:
+    - if: '$CI_MERGE_REQUEST_IID'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # kajanl: We actually do want two pipelines when there's a new commit to 'dev' and a pending merge request to 'master':
+    #   one is for the Development environment, the other is for Test. Yes, the pre-build test jobs will be run twice.
+    - if: '$CI_COMMIT_BRANCH == "dev" && $CI_OPEN_MERGE_REQUESTS'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    # kajanl: At the moment there's no need to run a pipeline for a push to 'master':
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH'
+
+stages:
+  - prepare
+  - build
+  - test
+  - upload
+  - deploy
+  - release
+  - SolMan
+
+# Jobs
+sanity check:
+  stage: prepare
+  needs: []
+  script:
+    # Sanity
+    - 'echo ${CI_PROJECT_PATH}'
+    # kajanl: Can't use 'git branch --show-current': a commit is checked out, so we have a detached HEAD: we /aren't/ on a branch.
+    - 'echo $CI_COMMIT_REF_NAME'
+    - 'test "$CI_COMMIT_REF_NAME"'
+    - 'git rev-parse HEAD'
+    # Is this pipeline for a merge request? If yes, it must be fast-forward:
+    # kajanl: It seems we have a clone of one branch only. Fetch the target branch to allow the --is-ancestor check.
+    - 'if [ "$CI_MERGE_REQUEST_IID" -a "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" ]; then
+        TB_DEPTH=0;
+        git remote set-branches --add origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME";
+        while [ -z "$(git merge-base "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" HEAD)" ]; do
+          git fetch --deepen 50 origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME";
+          NEW_TB_DEPTH=$(git log --oneline "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" | wc -l);
+          if [ "$TB_DEPTH" = "$NEW_TB_DEPTH" ]; then break; fi;
+          TB_DEPTH=$NEW_TB_DEPTH;
+        done;
+        if ! (git merge-base --is-ancestor "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" HEAD); then
+          echo "Error: This is not a fast forward merge request." >&2;
+          exit 1;
+        fi;
+       fi;'
+    # Is this the production branch?
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "production" -o "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" = "production" ]; then
+        RELEASE_VERSION=$(git tag --points-at HEAD | sed -n '/^v[0-9]\+\.[0-9]\+\.[0-9]\+$/{s/^v//;p}');
+        echo "$RELEASE_VERSION";
+        test "$RELEASE_VERSION";
+      fi;
+    - 'exit 0;'
+
+# Pre-Build Tests Tests Tests Tests Tests Tests Tests Tests Tests Tests Tests Tests
+#
+# kajanl: The problem here is that CODE_QUALITY_IMAGE from [1] tries to pull in codeclimate/codeclimate-structure,
+#   and somehow hits the 'toomanyrequests' error because of Docker-in-Docker, in spite of the runners now being on the
+#   enterprise license.
+#   [1] https://gitlab.com/gitlab-org/gitlab/-/blob/v13.9.1-ee/lib/gitlab/ci/templates/Jobs/Code-Quality.gitlab-ci.yml
+#
+# kajanl: In other dind experiments I had the problem that the /builds path was /not/ shared into the downstream docker
+#   image. I suspect code_quality is run on an empty directory.
+code_quality:
+  needs:
+    - job: 'sanity check'
+  before_script:
+    # GitLab runners hit docker pull limit despite the authentication
+    - mkdir -p $HOME/.docker
+    - echo "$DOCKER_AUTH_CONFIG" > $HOME/.docker/config.json
+  rules:
+    - if: '$CODE_QUALITY_DISABLED'
+      when: never
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "tms" ||
+          $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "production"
+      when: never
+    - if: '$CI_COMMIT_TAG || $CI_COMMIT_BRANCH'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME'
+
+# kajanl: https://gitlab.com/gitlab-org/gitlab/-/blob/v13.9.1-ee/lib/gitlab/ci/templates/Security/SAST.gitlab-ci.yml
+eslint-sast:
+  needs:
+    - job: 'sanity check'
+  rules:
+    - if: $SAST_DISABLED
+      when: never
+    - if: $SAST_EXCLUDED_ANALYZERS =~ /eslint/
+      when: never
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "tms" ||
+          $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "production"
+      when: never
+    - if: ($CI_COMMIT_BRANCH || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME) &&
+          $SAST_DEFAULT_ANALYZERS =~ /eslint/
+      exists:
+        - '**/*.html'
+        - '**/*.js'
+        - '**/*.jsx'
+        - '**/*.ts'
+        - '**/*.tsx'
+
+# kajanl: https://gitlab.com/gitlab-org/gitlab/-/blob/v13.9.1-ee/lib/gitlab/ci/templates/Security/SAST.gitlab-ci.yml
+nodejs-scan-sast:
+  needs:
+    - job: 'sanity check'
+  rules:
+    - if: $SAST_DISABLED
+      when: never
+    - if: $SAST_EXCLUDED_ANALYZERS =~ /nodejs-scan/
+      when: never
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "tms" ||
+          $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "production"
+      when: never
+    - if: ($CI_COMMIT_BRANCH || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME) &&
+          $SAST_DEFAULT_ANALYZERS =~ /nodejs-scan/
+      exists:
+        - '**/package.json'
+
+# Java
+# kajanl: https://gitlab.com/gitlab-org/gitlab/-/blob/v13.9.1-ee/lib/gitlab/ci/templates/Security/SAST.gitlab-ci.yml
+spotbugs-sast:
+  needs:
+    - job: 'sanity check'
+  rules:
+    - if: $SAST_EXCLUDED_ANALYZERS =~ /spotbugs/
+      when: never
+    - if: $SAST_DEFAULT_ANALYZERS =~ /mobsf/ &&
+          $SAST_EXPERIMENTAL_FEATURES == 'true'
+      exists:
+        - '**/AndroidManifest.xml'
+      when: never
+    - if: $SAST_DISABLED
+      when: never
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "tms" ||
+          $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "production"
+      when: never
+    - if: ($CI_COMMIT_BRANCH || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME) &&
+          $SAST_DEFAULT_ANALYZERS =~ /spotbugs/
+      exists:
+        - '**/*.groovy'
+        - '**/*.java'
+        - '**/*.scala'
+
+# kajanl: https://gitlab.com/gitlab-org/gitlab/-/blob/v13.9.1-ee/lib/gitlab/ci/templates/Security/Secret-Detection.gitlab-ci.yml
+secret_detection_default_branch:
+  needs:
+    - job: 'sanity check'
+  rules:
+    - if: $SECRET_DETECTION_DISABLED
+      when: never
+    - if: $CI_DEFAULT_BRANCH == $CI_COMMIT_BRANCH
+    - if: $CI_DEFAULT_BRANCH == $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+
+# kajanl: https://gitlab.com/gitlab-org/gitlab/-/blob/v13.9.1-ee/lib/gitlab/ci/templates/Security/Secret-Detection.gitlab-ci.yml
+secret_detection:
+  needs:
+    - job: 'sanity check'
+
+# Tests / Project Piper
+#   https://sap.github.io/jenkins-library/steps/sonarExecuteScan/
+#   https://github.com/SAP/jenkins-library/blob/e8c74a4867297757e5f357e29d8c4272219b196c/cmd/sonarExecuteScan.go
+#   https://github.com/SAP/jenkins-library/blob/e8c74a4867297757e5f357e29d8c4272219b196c/cmd/sonarExecuteScan_generated.go
+#   https://gitlab.com/gitlab-org/gitlab/-/blob/v13.6.0-ee/lib/gitlab/ci/templates/Jobs/Code-Quality.gitlab-ci.yml
+#
+#   To Docker:
+#     0 docker run -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:$PWD" -v /etc/ssl/certs/java/cacerts:/etc/ssl/certs/java/cacerts -v "sonar-scanner:/opt/sonar-scanner" -v "$HOME/bin/sonar-scanner:/usr/local/bin/sonar-scanner" -it docker:19.03.12-git
+#     1 wget -O /usr/local/bin/piper https://github.com/SAP/jenkins-library/releases/latest/download/piper && chmod +x /usr/local/bin/piper
+#       cp /etc/ssl/certs/java/cacerts ./
+#       export CACERTS=$PWD/cacerts
+#
+#     2 docker pull sonarsource/sonar-scanner-cli:latest
+#
+#       chmod +x /usr/local/bin/sonar-scanner
+#
+#     2.5 ~/bin/sonar-scanner
+#
+#     2.7 git clone --depth 50 https://code.acme.com/sap-aspire/scp/mbt/tst-hlo-com-acme-rgs-s-hello-aspire.git default
+#
+#     3 cd default
+#
+#         SONAR_HOST_URL    "https://sonarqube.acme.com"       # Must access from RCN
+#         SONAR_LOGIN       <the token>
+#         SONAR_PROJECT_KEY sap-aspire.scp.mbt.tst-hlo-com-acme-rgs-s-hello-aspire
+#   
+#       piper sonarExecuteScan --projectKey "$SONAR_PROJECT_KEY" --serverUrl "$SONAR_HOST_URL" --token "$SONAR_LOGIN" --branchName "$CI_COMMIT_REF_NAME" --projectVersion "$(git rev-parse HEAD)"
+sonarExecuteScan:
+  #extends:
+  #  - .shared_runners
+  image: ${DEVOPS_PIPER_SONAR_IMAGE}
+  stage: test
+  allow_failure: true
+  needs:
+    - job: 'sanity check'
+  rules:
+    - if: $SONAREXECUTESCAN_DISABLED
+      when: never
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "tms" ||
+          $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "production"
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+  cache:
+    key: "sonarExecuteScan-$CI_PROJECT_NAME"
+    paths:
+      - .sonar
+  script:
+    - test "$SONAR_LOGIN"
+    # Sonar cache, see https://community.sonarsource.com/t/set-cache-location-for-sonar-scanner/14451
+    - export SONAR_USER_HOME="$PWD/.sonar"
+    - mkdir -p "$SONAR_USER_HOME"
+    #
+    - export SONAR_PROJECT_KEY="$(echo "$CI_PROJECT_PATH" | tr '/' '.')"
+    - piper sonarExecuteScan --projectKey "$SONAR_PROJECT_KEY" --serverUrl "$SONAR_HOST_URL" --token "$SONAR_LOGIN" --branchName "$CI_COMMIT_REF_NAME" --projectVersion "$(git rev-parse HEAD)"
+  artifacts:
+    paths:
+      - '.pipeline/influx/'
+#
+# Pre-Build Tests Tests Tests Tests Tests Tests Tests Tests Tests Tests Tests Tests
+
+build:
+  stage: build
+  needs:
+    - job: 'sanity check'
+  # kajanl: At the moment this build is not explicitly environment-specific.
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+    - if: '$CI_COMMIT_BRANCH == "master"'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"'
+    - if: '$CI_COMMIT_BRANCH == "tms"'
+    - if: $CI_COMMIT_BRANCH =~ /^quality-/
+    - if: '$CI_COMMIT_BRANCH == "production"'
+  image: ${DEVOPS_MBT_IMAGE}
+  script:
+    - *add_sap_aspire_npm_repo
+    - "(cd / && npm i @sap-aspire/mta-traceability@${MTA_TRACEABILITY_TOOL_VERSION});"
+    - 'export PATH="/node_modules/.bin:$PATH"'
+    - 'mta-traceability -f mta.yaml'
+    - 'rm -rf mta_archives'
+    - 'mbt build'
+# TESTING
+#    - exit 1
+  artifacts:
+    paths:
+      - 'mta.yaml'
+      - 'mta_archives/'
+    # kajanl: Instead of expire_in, let's upload the artifacts we want to keep to generic packages.
+    #expire_in: never
+
+# release-assets-as-generic-package | https://gitlab.com/gitlab-org/release-cli/-/tree/master/docs/examples/release-assets-as-generic-package/
+upload qa build:
+  stage: upload
+  needs:
+    - job: 'build'
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^quality-/
+  script:
+    # kajanl: Shouldn't we compare RELEASE_VERSION to the version in the MTA.yaml?
+    - |
+      RELEASE_VERSION=$(echo "$CI_COMMIT_BRANCH" | sed -n '/^quality-[0-9]\+\.[0-9]\+\.[0-9]\+$/{s/^quality-//;p}')
+    - test "$RELEASE_VERSION"
+    #- |
+    #  MTA_VERSION=$(sed -n -e 's/^version: \(.*\)$/\1/; T; p;' mta.yaml)
+    - 'MTAR_FILE=$(basename mta_archives/*.mtar)'
+    - test "$MTAR_FILE"
+    - 'PACKAGE_REGISTRY_URL=${PACKAGE_REGISTRY_REL_ATS_URL}/$RELEASE_VERSION'
+    - echo "${PACKAGE_REGISTRY_URL}/${MTAR_FILE}"
+    #
+    # https://code.acme.com/help/user/packages/generic_packages/index.md#publish-a-generic-package-by-using-cicd
+    - 'CURL_RES=$(curl --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "mta_archives/${MTAR_FILE}"
+        "${PACKAGE_REGISTRY_URL}/${MTAR_FILE}")'
+    - echo "$CURL_RES"
+    - test "$CURL_RES" = '{"message":"201 Created"}'
+    #
+    - echo "RELEASE_VERSION=$RELEASE_VERSION" > release-variables.env
+    - echo RELEASE_ASSETS=--assets-link \''{"name":"'$MTAR_FILE'",
+                        "url":"'${PACKAGE_REGISTRY_URL}/${MTAR_FILE}'",
+                        "link_type":"other",
+                        "filepath":"/'$MTAR_FILE'"}'\' >> release-variables.env
+  artifacts:
+    reports:
+      dotenv: release-variables.env
+
+upload prd build:
+  stage: upload
+  needs:
+    - job: 'build'
+  rules:
+    - if: $CI_COMMIT_BRANCH == "production"
+  script:
+    # kajanl: Shouldn't we compare RELEASE_VERSION to the version in the MTA.yaml?
+    - |
+      RELEASE_VERSION=$(git tag --points-at HEAD | sed -n '/^v[0-9]\+\.[0-9]\+\.[0-9]\+$/{s/^v//;p}');
+    - test "$RELEASE_VERSION"
+    - 'MTAR_FILE=$(basename mta_archives/*.mtar)'
+    - test "$MTAR_FILE"
+    - 'PACKAGE_REGISTRY_URL=${PACKAGE_REGISTRY_PRD_ATS_URL}/$RELEASE_VERSION'
+    - echo "${PACKAGE_REGISTRY_URL}/${MTAR_FILE}"
+    #
+    - 'CURL_RES=$(curl --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "mta_archives/${MTAR_FILE}"
+        "${PACKAGE_REGISTRY_URL}/${MTAR_FILE}")'
+    - echo "$CURL_RES"
+    - test "$CURL_RES" = '{"message":"201 Created"}'
+
+.deploy:
+  stage: deploy
+  needs:
+    - job: 'build'
+  interruptible: false
+  script:
+    - *clone_devops_scripts
+    - '. .gitlab-ci-vars.sh'
+    - *test_WI_in_development
+    #
+    - 'BTP_DEPLOY_API="$(eval echo \$BTP_DEPLOY_API_$ENV_CAPS)"'
+    - 'BTP_DEPLOY_ORG="$(eval echo \$BTP_DEPLOY_ORG_$ENV_CAPS)"'
+    - 'BTP_DEPLOY_SPACE="$(eval echo \$BTP_DEPLOY_SPACE_$ENV_CAPS)"'
+    - 'BTP_DEPLOY_USER="$(eval echo \$BTP_DEPLOY_USER_$ENV_CAPS)"'
+    - 'BTP_DEPLOY_PASS="$(eval echo \$BTP_DEPLOY_PASS_$ENV_CAPS)"'
+    - 'test "$BTP_DEPLOY_PASS"'
+    - 'MTA_EXT_FILE="${ENV_LOWC}-env.mtaext"'
+    #
+    - 'echo cf login -a \"$BTP_DEPLOY_API\" -o \"$BTP_DEPLOY_ORG\" -s \"$BTP_DEPLOY_SPACE\"
+        -u \"$BTP_DEPLOY_USER\" -p \"***\"'
+    - 'cf login -a "$BTP_DEPLOY_API" -o "$BTP_DEPLOY_ORG" -s "$BTP_DEPLOY_SPACE"
+        -u "$BTP_DEPLOY_USER" -p "$BTP_DEPLOY_PASS"'
+    #
+    - 'if [ -e "$MTA_EXT_FILE" ]; then
+        MTA_EXT_OPT="-e $MTA_EXT_FILE";
+        mtaext-vars -i inplace -v deployment_environment=$ENV_CAPS $MTA_EXT_FILE;
+       fi;'
+    # 
+    - cf deploy mta_archives/*.mtar --abort-on-error $MTA_EXT_OPT
+  # https://docs.gitlab.com/ee/ci/environments/index.html#deployment-tier-of-environments
+  #environment:
+
+deploy to Development:
+  extends: .deploy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+  before_script:
+    - 'ENV_CAPS=DEV'
+    - 'ENV_LOWC=dev'
+  environment:
+    name: Development
+    deployment_tier: development
+  resource_group: Development
+
+deploy to Test:
+  extends: .deploy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"'
+  before_script:
+    - 'ENV_CAPS=TEST'
+    - 'ENV_LOWC=test'
+  environment:
+    name: Test
+    deployment_tier: testing
+  resource_group: Test
+
+deploy to Quality:
+  extends: .deploy
+  needs:
+    - job: 'build'
+    - job: 'upload qa build'
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^quality-/
+      #when: manual # 20210603: Made non-manual to allow click-less SolMan integration
+  before_script:
+    - test "$RELEASE_VERSION"
+    - echo "$RELEASE_ASSETS"
+    - 'ENV_CAPS=QA'
+    - 'ENV_LOWC=qa'
+  environment:
+    name: Quality
+    deployment_tier: staging
+  resource_group: Quality
+
+deploy to Production:
+  extends: .deploy
+  needs:
+    - job: 'build'
+    - job: 'upload prd build'
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "production"'
+      when: manual
+  before_script:
+    - 'ENV_CAPS=PRD'
+    - 'ENV_LOWC=prd'
+  environment:
+    name: Production
+    deployment_tier: production
+  resource_group: Production
+
+deploy to TMS:
+  stage: deploy
+  needs:
+    - job: 'build'
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "tms"'
+      when: manual
+  interruptible: false
+  script:
+    - *clone_devops_scripts
+    - '. .gitlab-ci-vars.sh'
+    - *test_WI_in_development
+    - 'echo "TEST_SKIP_TMS_UPLOAD=${TEST_SKIP_TMS_UPLOAD}"'
+    - 'if [ "$WORK_ITEM" ]; then
+          DESCRIPTION="WI: $WORK_ITEM";
+       else
+          DESCRIPTION="DC: $DEFECT_CORRECTION";
+       fi;'
+    - 'COMMIT=$(git rev-parse HEAD)'
+    - 'test "$COMMIT"'
+    # DCP is set to /not/ perform automatic forwarding.
+    - 'DOFORWARD="1"'
+    - 'TARGET_NODE="$TRANSPORT_SERVICE_NODE"'
+    - 'echo "TARGET_NODE=$TARGET_NODE"'
+    - 'if [ "${TEST_SKIP_TMS_UPLOAD}" ]; then
+          echo "{\"transportRequestId\": ${TEST_SKIP_TMS_UPLOAD}}" > tms-upload-stdout.json;
+        else
+          tms-upload "$DESCRIPTION" "mta_archives" "$TARGET_NODE" 1 "$DOFORWARD" "${CI_PROJECT_ID}" "$COMMIT" > tms-upload-stdout.json;
+        fi;'
+    - 'cat tms-upload-stdout.json'
+  artifacts:
+    paths:
+      - 'tms-upload-stdout.json'
+  environment:
+    name: TMS
+    deployment_tier: staging
+  resource_group: TMS
+
+release:
+  stage: release
+  needs:
+    - job: 'upload qa build'
+    - job: 'deploy to Quality'
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^quality-/
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  script:
+    - test "$RELEASE_VERSION"
+    - set -x
+    - eval release-cli create --name "$RELEASE_VERSION"
+        --tag-name "v$RELEASE_VERSION"
+        $RELEASE_ASSETS
+
+assign to WI:
+  stage: SolMan
+  needs:
+    - job: 'deploy to TMS'
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "tms"'
+  image: ${DEVOPS_PUPPETEER_IMAGE}
+  script:
+    - *add_sap_aspire_npm_repo
+    - '. .gitlab-ci-vars.sh'
+    - "(cd / && npm i @sap-aspire/assign-transport-request@${ASSIGN_TRANSPORT_REQUEST_VERSION});"
+    - 'export PATH="/node_modules/.bin:$PATH"'
+    - 'TRANSPORT_REQUEST_ID=$(jq ".transportRequestId" tms-upload-stdout.json)'
+    - 'test "${TRANSPORT_REQUEST_ID}"'
+    - 'echo TRANSPORT_REQUEST_ID=${TRANSPORT_REQUEST_ID} WI=${WORK_ITEM} DC=${DEFECT_CORRECTION}'
+    # kajanl: It seems sometimes a search in SolMan doesn't yet see the fresh transport request. Add some wait time here.
+    - sleep 4
+    - 'if ( test "$WORK_ITEM" ); then
+          assign-transport-request --solman-host "${SOLMAN_HOST}" -t "${TRANSPORT_REQUEST_ID}" --work-item-number "${WORK_ITEM}";
+       else
+          assign-transport-request --solman-host "${SOLMAN_HOST}" -t "${TRANSPORT_REQUEST_ID}" --defect-correction-number "${DEFECT_CORRECTION}";
+       fi;
+      '
+  artifacts:
+    when: on_failure # consider 'always'
+    paths:
+      - '**.png' # debugging screenshots
+  resource_group: SolMan
+
+# kajanl: Temporary implementation while child pipeline can't be used, see below.
+include:
+  # https://gitlab.com/gitlab-org/gitlab/blob/master/lib/gitlab/ci/templates/Auto-DevOps.gitlab-ci.yml
+  #  - template: Auto-DevOps.gitlab-ci.yml
+  - template: Jobs/Code-Quality.gitlab-ci.yml
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+# vim:et:ic:
